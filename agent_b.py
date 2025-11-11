@@ -6,6 +6,8 @@ from planner import LLMPlanner
 from executor import WebExecutor
 from state_detector import StateDetector
 from storage import DatasetStorage
+import signal
+import sys
 
 class WebAgent:
     # Main agent that coordinates LLM, browser, and storage
@@ -14,124 +16,175 @@ class WebAgent:
         self.planner = LLMPlanner()
         self.executor = WebExecutor(headless=headless, slow_mo=slow_mo, use_existing_browser=use_existing_browser)
         self.state_detector = StateDetector()
+        
+        # For handling interruptions
+        self.current_storage = None
+        self.current_task_info = None
+        self.current_instruction = None
+        self.current_action_history = None
 
     def execute_task(self, instruction: str):
         # Reset state detector for fresh task to clear previous phash states
         self.state_detector.reset()
 
-        # Step 1: LLM parses instruction to get URL + task
-        print(" parsing instruction ")
-        task_info = self.planner.parse_instruction(instruction)
-        app_name = task_info["app_name"]
-        url = task_info["url"]
-        task = task_info["task"]
-        print(f"   Task: {task}")
-        print(f"   URL: {url}")
+        storage = None
+        task_info = None
+        action_history = []
+        
+        # Store current task for interruption handling
+        self.current_storage = None
+        self.current_task_info = None
+        self.current_instruction = instruction
+        self.current_action_history = action_history
+        
+        def handle_interrupt(signum, frame):
+            print("\nInterrupted - saving metadata...")
+            if storage and task_info:
+                storage.save_metadata(instruction, task_info, action_history, error="Interrupted by user")
+                print("Metadata saved despite interruption")
+            sys.exit(1)
+        
+        # Set up signal handler
+        original_handler = signal.signal(signal.SIGINT, handle_interrupt)
+        
+        try:
+            # Step 1: LLM parses instruction to get URL + task
+            print(" parsing instruction ")
+            task_info = self.planner.parse_instruction(instruction)
+            app_name = task_info["app_name"]
+            url = task_info["url"]
+            task = task_info["task"]
+            print(f"   Task: {task}")
+            print(f"   URL: {url}")
 
-        # Step 2: Setup storage for this task
-        storage = DatasetStorage(task_name=task, app_name=app_name)
+            # Step 2: Setup storage for this task
+            storage = DatasetStorage(task_name=task, app_name=app_name)
+            self.current_storage = storage
+            self.current_task_info = task_info
 
-        # Step 3: Open browser and navigate
-        print(f"   Navigating to {url}...")
-        self.executor.navigate(url)
-        screenshot = self.executor.get_screenshot()
+            # Step 3: Open browser and navigate
+            print(f"   Navigating to {url}...")
+            self.executor.navigate(url)
+            screenshot = self.executor.get_screenshot()
 
-        # Save initial screenshot
-        if self.state_detector.is_new_state(screenshot, force_save=True):
-            storage.save_screenshot(screenshot, "00_initial", "Initial page load", url, {"action": "navigate"})
+            # Save initial screenshot
+            if self.state_detector.is_new_state(screenshot, force_save=True):
+                storage.save_screenshot(screenshot, "00_initial", "Initial page load", url, {"action": "navigate"})
 
-        # Step 4: Main loop where LLM decides actions until done
-        step = 0
-        max_steps = 10  # Safety limit
-        action_history = []  # Track all actions taken
-        use_vision_for_step = False  # Optional selective vision
+            # Step 4: Main loop where LLM decides actions until done
+            step = 0
+            max_steps = 10  # Safety limit
+            action_history = []  # Track all actions taken
+            use_vision_for_step = False  # Optional selective vision
 
-        while step < max_steps:
-            step += 1
-            print(f"\n    Step {step}/{max_steps}")
+            while step < max_steps:
+                step += 1
+                print(f"\n    Step {step}/{max_steps}")
 
-            # Extract DOM elements
-            print("   Extracting page elements...")
-            dom_context = self.executor.extract_dom_context(max_elements=50)
-            current_url = self.executor.get_current_url()
+                # Update current action history
+                self.current_action_history = action_history
 
-            # Show elements found 
-            lines = dom_context.split('\n')
-            elem_lines = [l for l in lines if l.strip().startswith('[')]
-            if elem_lines:
-                print(f"   Found {len(elem_lines)} interactive elements:")
-            else:
-                print(f"    WARNING: Found 0 interactive elements!")
+                # Extract DOM elements
+                print("   Extracting page elements...")
+                dom_context = self.executor.extract_dom_context(max_elements=50)
+                current_url = self.executor.get_current_url()
 
-            # Optional selective vision which is used on step 1 or if previous action failed
-            screenshot_for_llm = None
-            if step == 1 or use_vision_for_step:
-                screenshot_for_llm = self.executor.get_screenshot()
-                print("    Using vision for this step")
+                # Show elements found 
+                lines = dom_context.split('\n')
+                elem_lines = [l for l in lines if l.strip().startswith('[')]
+                if elem_lines:
+                    print(f"   Found {len(elem_lines)} interactive elements:")
+                else:
+                    print(f"    WARNING: Found 0 interactive elements!")
 
-            use_vision_for_step = False  # Reset flag
+                # Optional selective vision which is used on step 1 or if previous action failed
+                screenshot_for_llm = None
+                if step == 1 or use_vision_for_step:
+                    screenshot_for_llm = self.executor.get_screenshot()
+                    print("    Using vision for this step")
 
-            # LLM decides next action with optional vision
-            print("   Asking LLM for next action...")
-            action = self.planner.decide_next_action(
-                task=task,
-                dom_context=dom_context,
-                current_url=current_url,
-                action_history=action_history,
-                step_number=step,
-                screenshot=screenshot_for_llm  # Optional and works with or without vision LLMs
-            )
+                use_vision_for_step = False  # Reset flag
 
-            # Show the LLM's thinking process
-            if action.get("thinking"):
-                print(f"   Thinking: {action['thinking'][:80]}...")
-            if action.get("evaluation_previous_goal"):
-                print(f"   Evaluation: {action['evaluation_previous_goal'][:60]}...")
-            if action.get("memory"):
-                print(f"   Memory: {action['memory']}")
-            if action.get("next_goal"):
-                print(f"   Next: {action['next_goal']}")
+                # LLM decides next action with optional vision
+                print("   Asking LLM for next action...")
+                action = self.planner.decide_next_action(
+                    task=task,
+                    dom_context=dom_context,
+                    current_url=current_url,
+                    action_history=action_history,
+                    step_number=step,
+                    screenshot=screenshot_for_llm  # Optional and works with or without vision LLMs
+                )
 
-            # Check if task is complete
-            if action.get("action") == "stop":
-                print(f"   Task complete")
-                break
+                # Show the LLM's thinking process
+                if action.get("thinking"):
+                    print(f"   Thinking: {action['thinking'][:80]}...")
+                if action.get("evaluation_previous_goal"):
+                    print(f"   Evaluation: {action['evaluation_previous_goal'][:60]}...")
+                if action.get("memory"):
+                    print(f"   Memory: {action['memory']}")
+                if action.get("next_goal"):
+                    print(f"   Next: {action['next_goal']}")
 
-            # Show what action we're taking
-            action_desc = action.get("next_goal") or action.get("description", "")
-            print(f"   {action['action'].upper()}: {action_desc}")
+                # Check if task is complete
+                if action.get("action") == "stop":
+                    print(f"   Task complete")
+                    break
 
-            # Execute the action
-            result = self.executor.execute_action(action)
+                # Show what action we're taking
+                action_desc = action.get("next_goal") or action.get("description", "")
+                print(f"   {action['action'].upper()}: {action_desc}")
 
-            # If action failed and we didn't use vision, retry with vision next step
-            if not result.get("success") and not screenshot_for_llm:
-                print("    Action failed - will use vision on retry")
-                use_vision_for_step = True
-                step -= 1  # Retry this step
-                continue
+                # Execute the action
+                result = self.executor.execute_action(action)
 
-            # Record action in history so LLM knows what it did
-            action_history.append(action)
+                # If action failed and we didn't use vision, retry with vision next step
+                if not result.get("success") and not screenshot_for_llm:
+                    print("    Action failed - will use vision on retry")
+                    use_vision_for_step = True
+                    step -= 1  # Retry this step
+                    continue
 
-            # Capture screenshot if needed
-            if action.get("capture") in ["post", "both"]:
-                screenshot = self.executor.get_screenshot()
-                if self.state_detector.is_new_state(screenshot):
-                    name = f"{step:02d}_after_{action['action']}"
-                    # Use next_goal as description
-                    desc = action.get("next_goal") or action.get("description") or action.get("thinking", "")[:50]
-                    storage.save_screenshot(screenshot, name, desc, current_url, action)
-                    print(f"   Screenshot saved")
+                # Record action in history so LLM knows what it did
+                action_history.append(action)
 
-        # Step 5: Save the metadata
-        storage.save_metadata(instruction, task_info, action_history)
+                # Capture screenshot if needed
+                if action.get("capture") in ["post", "both"]:
+                    screenshot = self.executor.get_screenshot()
+                    if self.state_detector.is_new_state(screenshot):
+                        name = f"{step:02d}_after_{action['action']}"
+                        # Use next_goal as description
+                        desc = action.get("next_goal") or action.get("description") or action.get("thinking", "")[:50]
+                        storage.save_screenshot(screenshot, name, desc, current_url, action)
+                        print(f"   Screenshot saved")
 
-        return {
-            "success": True,
-            "output_dir": storage.task_dir,
-            "screenshots": storage.screenshot_count
-        }
+            # Step 5: Save the metadata
+            storage.save_metadata(instruction, task_info, action_history)
+
+            return {
+                "success": True,
+                "output_dir": storage.task_dir,
+                "screenshots": storage.screenshot_count
+            }
+
+        except Exception as e:
+            print(f"   Error during task: {e}")
+            # Save metadata even when task fails
+            if storage and task_info:
+                storage.save_metadata(instruction, task_info, action_history, error=str(e))
+            return {
+                "success": False,
+                "output_dir": storage.task_dir if storage else None,
+                "screenshots": storage.screenshot_count if storage else 0,
+                "error": str(e)
+            }
+        finally:
+            # Restore original signal handler and clear current task
+            signal.signal(signal.SIGINT, original_handler)
+            self.current_storage = None
+            self.current_task_info = None
+            self.current_instruction = None
+            self.current_action_history = None
 
     def close(self):
         self.executor.close()
